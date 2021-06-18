@@ -2,10 +2,12 @@
 
 #[macro_use]
 extern crate napi_derive;
-
-use std::convert::TryInto;
-
-use napi::{CallContext, Env, JsNumber, JsObject, Result, Task};
+extern crate tauri_hotkey;
+use napi::{
+  threadsafe_function::{ThreadSafeCallContext, ThreadsafeFunctionCallMode},
+  CallContext, Env, JsBoolean, JsFunction, JsObject, JsString, JsUndefined, Property, Result,
+};
+use tauri_hotkey::{parse_hotkey, Hotkey, HotkeyManager};
 
 #[cfg(all(
   unix,
@@ -21,43 +23,91 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-struct AsyncTask(u32);
-
-impl Task for AsyncTask {
-  type Output = u32;
-  type JsValue = JsNumber;
-
-  fn compute(&mut self) -> Result<Self::Output> {
-    use std::thread::sleep;
-    use std::time::Duration;
-    sleep(Duration::from_millis(self.0 as u64));
-    Ok(self.0 * 2)
-  }
-
-  fn resolve(self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    env.create_uint32(output)
-  }
+fn hotkey_to_napi_err(hotkey_err: tauri_hotkey::Error) -> napi::Error {
+  napi::Error::from_reason(hotkey_err.to_string())
 }
 
 #[module_exports]
-fn init(mut exports: JsObject) -> Result<()> {
-  exports.create_named_method("sync", sync_fn)?;
-
-  exports.create_named_method("sleep", sleep)?;
+fn init(mut exports: JsObject, env: Env) -> Result<()> {
+  let hotkey_manager_class = env.define_class(
+    "HotkeyManager",
+    hotkey_manager_constructor,
+    &[
+      Property::new(&env, "register")?.with_method(register_hotkey),
+      Property::new(&env, "unregister")?.with_method(unregister_hotkey),
+      Property::new(&env, "unregisterAll")?.with_method(unregister_all),
+      Property::new(&env, "checkIsRegistered")?.with_method(check_hotkey_is_registered),
+    ],
+  )?;
+  exports.set_named_property("HotkeyManager", hotkey_manager_class)?;
   Ok(())
 }
 
 #[js_function(1)]
-fn sync_fn(ctx: CallContext) -> Result<JsNumber> {
-  let argument: u32 = ctx.get::<JsNumber>(0)?.try_into()?;
+fn hotkey_manager_constructor(ctx: CallContext) -> Result<JsUndefined> {
+  let manager = HotkeyManager::new();
+  let mut this: JsObject = ctx.this_unchecked();
+  ctx.env.wrap(&mut this, manager)?;
+  ctx.env.get_undefined()
+}
 
-  ctx.env.create_uint32(argument + 100)
+#[js_function(2)]
+fn register_hotkey(ctx: CallContext) -> Result<JsUndefined> {
+  let hotkey_utf8 = ctx.get::<JsString>(0)?.into_utf8()?;
+  let hotkey_str = hotkey_utf8.as_str()?;
+  let callback_js_func = ctx.get::<JsFunction>(1)?;
+  let mut this: JsObject = ctx.this_unchecked();
+  let manager = ctx.env.unwrap::<HotkeyManager>(&mut this)?;
+
+  let hotkey: Hotkey = parse_hotkey(&hotkey_str).map_err(hotkey_to_napi_err)?;
+
+  let ts_callback =
+    ctx
+      .env
+      .create_threadsafe_function(&callback_js_func, 0, |ctx: ThreadSafeCallContext<()>| {
+        Ok(vec![ctx.env.get_undefined()?])
+      })?;
+
+  manager
+    .register(hotkey, move || {
+      ts_callback.call(Ok(()), ThreadsafeFunctionCallMode::NonBlocking);
+    })
+    .map_err(hotkey_to_napi_err)?;
+
+  ctx.env.get_undefined()
 }
 
 #[js_function(1)]
-fn sleep(ctx: CallContext) -> Result<JsObject> {
-  let argument: u32 = ctx.get::<JsNumber>(0)?.try_into()?;
-  let task = AsyncTask(argument);
-  let async_task = ctx.env.spawn(task)?;
-  Ok(async_task.promise_object())
+fn unregister_hotkey(ctx: CallContext) -> Result<JsUndefined> {
+  let hotkey_utf8 = ctx.get::<JsString>(0)?.into_utf8()?;
+  let hotkey_str = hotkey_utf8.as_str()?;
+  let mut this: JsObject = ctx.this_unchecked();
+  let manager = ctx.env.unwrap::<HotkeyManager>(&mut this)?;
+
+  let hotkey: Hotkey = parse_hotkey(&hotkey_str).map_err(hotkey_to_napi_err)?;
+  manager.unregister(&hotkey).map_err(hotkey_to_napi_err)?;
+
+  ctx.env.get_undefined()
+}
+
+#[js_function(0)]
+fn unregister_all(ctx: CallContext) -> Result<JsUndefined> {
+  let mut this: JsObject = ctx.this_unchecked();
+  let manager = ctx.env.unwrap::<HotkeyManager>(&mut this)?;
+
+  manager.unregister_all().map_err(hotkey_to_napi_err)?;
+
+  ctx.env.get_undefined()
+}
+
+#[js_function(1)]
+fn check_hotkey_is_registered(ctx: CallContext) -> Result<JsBoolean> {
+  let hotkey_utf8 = ctx.get::<JsString>(0)?.into_utf8()?;
+  let hotkey_str = hotkey_utf8.as_str()?;
+  let mut this: JsObject = ctx.this_unchecked();
+  let manager = ctx.env.unwrap::<HotkeyManager>(&mut this)?;
+
+  let hotkey: Hotkey = parse_hotkey(&hotkey_str).map_err(hotkey_to_napi_err)?;
+
+  ctx.env.get_boolean(manager.is_registered(&hotkey))
 }
