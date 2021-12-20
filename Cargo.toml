@@ -10,7 +10,7 @@ version = "0.1.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = {version = "1", features = ["napi4"]}
+napi = {version = "2", features = ["napi4"]}
 napi-derive = "1"
 tauri-hotkey = "0.1.2"
 
